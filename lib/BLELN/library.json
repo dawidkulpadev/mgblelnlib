@@ -1,0 +1,25 @@
+{
+  "name": "BLELN",
+  "version": "1.1.0",
+  "description": "BLE Local Network library",
+  "keywords": ["esp32", "arduino", "library"],
+  "license": "MIT",
+  "authors": [
+    { "name": "Dawid Kulpa", "email": "dawidkulpadev@gmail.com" }
+  ],
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32"],
+  "build": {
+    "flags": [
+      "-DCONFIG_BT_NIMBLE_MAX_CONNECTIONS=4"
+    ],
+    "srcFilter": [
+      "+<*>",
+      "-<examples/>",
+      "-<test/>"
+    ]
+  },
+  "dependencies": {
+    "h2zero/NimBLE-Arduino": "^2.0.0"
+  }
+}
