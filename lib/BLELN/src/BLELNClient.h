@@ -15,17 +15,21 @@ struct RxClientPacket {
 
 class BLELNClient : public NimBLEScanCallbacks, public NimBLEClientCallbacks{
 public:
-    void start(const std::string &name, std::function<void(std::string)> onServerResponse);
+    void start(const std::string &name, std::function<void(const std::string&)> onServerResponse);
     void stop();
     void startServerSearch(uint32_t durationMs, const std::string &serverUUID, const std::function<void(const NimBLEAdvertisedDevice *advertisedDevice)>& onResult);
-    void beginConnect(const NimBLEAdvertisedDevice *advertisedDevice);
+    void beginConnect(const NimBLEAdvertisedDevice *advertisedDevice, const std::function<void(bool, int)> &onConnectResult);
     bool sendEncrypted(const std::string& msg);
+    void disconnect();
 
     bool isScanning() const;
     bool isConnected();
     bool hasDiscoveredClient();
 
     void onConnect(NimBLEClient* pClient) override;
+
+    void onConnectFail(NimBLEClient *pClient, int reason) override;
+
     void onDiscovered(const NimBLEAdvertisedDevice* advertisedDevice) override;
     void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override;
     void onScanEnd(const NimBLEScanResults& scanResults, int reason) override;
@@ -53,7 +57,8 @@ private:
     std::function<void(const NimBLEAdvertisedDevice *advertisedDevice)> onScanResult;
     std::string searchedUUID;
 
-    std::function<void(std::string)> onMsgRx;
+    std::function<void(const std::string&)> onMsgRx;
+    std::function<void(bool, int)> onConRes;
     bool runRxWorker=false;
 
     QueueHandle_t g_rxQueue;
@@ -68,8 +73,6 @@ private:
     uint8_t  s_cliPub[65], s_cliNonce[12];
     uint8_t  s_sessKey_c2s[32], s_sessKey_s2c[32];
     uint32_t s_ctr_c2s=0, s_ctr_s2c=0;
-
-
 };
 
 

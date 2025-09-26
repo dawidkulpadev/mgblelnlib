@@ -30,10 +30,13 @@ struct RxPacket {
     uint8_t* buf;    // malloc/free
 };
 
-class BLELNServer : public NimBLEServerCallbacks{
+class BLELNServer : public NimBLEScanCallbacks, public NimBLEServerCallbacks{
 public:
     // User methods
     void start(Preferences *prefs, const std::string &name, const std::string &uuid);
+    void stop();
+
+    void startOtherServerSearch(uint32_t durationMs, const std::string &therUUID, const std::function<void(bool)>& onResult);
 
     bool getConnContext(uint16_t h, BLELNConnCtx** c);
 
@@ -41,6 +44,8 @@ public:
     void notifyChDataTx();
     void maybe_rotate(Preferences *prefs);
 
+
+    bool noClientsConnected();
 
     void appendToQueue(uint16_t h, const std::string &m);
     void rxWorker();
@@ -72,15 +77,21 @@ private:
 
     // BLELN
     std::vector<BLELNConnCtx> connCtxs;
+    bool runRxWorker=false;
+
+    bool scanning = false;
+    std::function<void(bool found)> onScanResult;
+    std::string searchedUUID;
 
     // Private methods
     bool sendEncrypted(int i, const std::string& msg);
     void sendKeyToClient(BLELNConnCtx *cx);
 
     // Callbacks
+    void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override;
+    void onScanEnd(const NimBLEScanResults& scanResults, int reason) override;
     void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override;
     void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override;
-    uint32_t onPassKeyDisplay() override;
     void onDataWrite(NimBLECharacteristic* c, NimBLEConnInfo& info);
     void onKeyExRxWrite(NimBLECharacteristic* c, NimBLEConnInfo& info);
     void onKeyExTxSubscribe(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo, uint16_t subValue);

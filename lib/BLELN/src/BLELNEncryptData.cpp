@@ -7,7 +7,7 @@
 #include "BLELNEncryptData.h"
 #include "BLELNBase.h"
 
-    bool BLELNEncryptData::makeServerKeys(mbedtls_ctr_drbg_context *ctr_drbg) {
+bool BLELNEncryptData::makeServerKeys(mbedtls_ctr_drbg_context *ctr_drbg) {
     mbedtls_ecp_group_init(&grp);
     mbedtls_mpi_init(&d);
     mbedtls_ecp_point_init(&Q);
@@ -109,7 +109,6 @@ bool BLELNEncryptData::deriveSessionKey(mbedtls_ctr_drbg_context *ctr_drbg, cons
 
 bool BLELNEncryptData::decryptAESGCM(const uint8_t* in, size_t inLen, std::string &out) {
     if (inLen < 4 + 12 + 16) {
-        Serial.println("Raw rx is too short");
         return false;
     }
 
@@ -124,7 +123,6 @@ bool BLELNEncryptData::decryptAESGCM(const uint8_t* in, size_t inLen, std::strin
     const uint8_t* tag = p;
 
     if (ctr <= lastCtr_c2s){
-        Serial.println("Last Ctr > ctr");
         return false;
     }
 
@@ -144,7 +142,6 @@ bool BLELNEncryptData::decryptAESGCM(const uint8_t* in, size_t inLen, std::strin
     mbedtls_gcm_context gcm; mbedtls_gcm_init(&gcm);
     if (mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, sessKey_c2s, 256) != 0) {
         mbedtls_gcm_free(&gcm);
-        Serial.println("mbedtls_gcm_setkey failed");
         return false;
     }
 
@@ -156,7 +153,6 @@ bool BLELNEncryptData::decryptAESGCM(const uint8_t* in, size_t inLen, std::strin
                                       ct, (unsigned char*)out.data());
     mbedtls_gcm_free(&gcm);
     if (rc != 0) {
-        Serial.println(("mbedtls_gcm_auth_decrypt: "+std::to_string(rc)).c_str());
         return false;
     }
 

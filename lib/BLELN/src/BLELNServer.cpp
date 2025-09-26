@@ -64,12 +64,14 @@ void BLELNServer::start(Preferences *prefs, const std::string &name, const std::
     txMtx = xSemaphoreCreateMutex();
     g_rxQueue = xQueueCreate(20, sizeof(RxPacket));
 
+    runRxWorker= true;
     xTaskCreatePinnedToCore(
             [](void* arg){
                 static_cast<BLELNServer*>(arg)->rxWorker();
+                Serial.println("BLELN Server: rx worker stopped");
                 vTaskDelete(nullptr);
             },
-            "BLELNrx", 4096, this, 5, nullptr, 1);
+            "BLELNrx", 2560, this, 5, nullptr, 1);
 
     BLELNBase::load_or_init_psk(prefs, g_psk_salt, &g_epoch);
     BLELNBase::rng_init();
@@ -106,6 +108,7 @@ void BLELNServer::start(Preferences *prefs, const std::string &name, const std::
     g_lastRotateMs = millis();
 }
 
+
 bool BLELNServer::getConnContext(uint16_t h, BLELNConnCtx** ctx) {
     *ctx = nullptr;
 
@@ -137,10 +140,6 @@ void BLELNServer::maybe_rotate(Preferences *prefs) {
     }
 }
 
-uint32_t BLELNServer::onPassKeyDisplay() {
-    return 123456;
-}
-
 void BLELNServer::sendKeyToClient(BLELNConnCtx *cx) {
     // KEYEX_TX: [ver=1][epoch:4B][salt:32B][srvPub:65B][srvNonce:12B]
     std::string keyex;
@@ -166,35 +165,39 @@ void BLELNServer::appendToQueue(uint16_t h, const std::string &m) {
     memcpy(heapBuf, m.data(), m.size());
 
     RxPacket pkt{ h, m.size(), heapBuf };
-    if (xQueueSend(g_rxQueue, &pkt, 0) != pdPASS) {
+    if (xQueueSend(g_rxQueue, &pkt, pdMS_TO_TICKS(10)) != pdPASS) {
         free(heapBuf);
     }
 }
 
 void BLELNServer::rxWorker() {
-    for (;;) {
+   for(;;) {
+        if(!runRxWorker){
+            if (g_rxQueue) {
+                RxPacket pkt{};
+                while (xQueueReceive(g_rxQueue, &pkt, 0) == pdPASS) {
+                    free(pkt.buf);
+                }
+            }
+            return;
+        }
+
         RxPacket pkt{};
-        if (xQueueReceive(g_rxQueue, &pkt, portMAX_DELAY) == pdTRUE) {
+        if (xQueueReceive(g_rxQueue, &pkt, 0) == pdTRUE) {
             BLELNConnCtx *cx;
             if(getConnContext(pkt.conn, &cx) and (cx!= nullptr)) {
                 std::string v(reinterpret_cast<char*>(pkt.buf), pkt.len);
 
-                // hexDump("RX", reinterpret_cast<const uint8_t *>(v.data()), v.size());
-
                 std::string plain;
-                if (!cx->getEncData()->decryptAESGCM((const uint8_t *) v.data(), v.size(), plain)) {
-                    Serial.printf("[DATA] decrypt fail (conn=%u)\n\r", cx->getHandle());
-                    return;
+                if (cx->getEncData()->decryptAESGCM((const uint8_t *) v.data(), v.size(), plain)) {
+                    if (plain.size() > 200) plain.resize(200);
+                    for (auto &ch: plain) if (ch == '\0') ch = ' ';
+
+                    if(onMsgReceived)
+                        onMsgReceived(cx->getHandle(), plain);
+                } else {
+                    // TODO: Inform error
                 }
-
-                if (plain.size() > 200) plain.resize(200);
-                for (auto &ch: plain) if (ch == '\0') ch = ' ';
-
-                // std::string dat = "[RX]: (" + std::to_string(cx->getHandle()) + ") - " + plain;
-                // Serial.println(dat.c_str());
-
-                if(onMsgReceived)
-                    onMsgReceived(cx->getHandle(), plain);
 
                 free(pkt.buf);
             }
@@ -203,7 +206,7 @@ void BLELNServer::rxWorker() {
         if(uxQueueMessagesWaiting(g_rxQueue)>0){
             vTaskDelay(pdMS_TO_TICKS(1));
         } else {
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
     }
 }
@@ -291,9 +294,61 @@ bool BLELNServer::sendEncrypted(const std::string &msg) {
     return true;
 }
 
+void BLELNServer::stop() {
+    NimBLEDevice::stopAdvertising();
+    // Stop rx worker
+    runRxWorker= false;
 
+    if(g_rxQueue)
+        xQueueReset(g_rxQueue);
 
-void BLELNServer::setOnMessageReceivedCallback(std::function<void(uint16_t, const std::string &)> cb) {
+    // Disconnect every client
+    if (srv!=nullptr) {
+        if(xSemaphoreTake(clisMtx, pdMS_TO_TICKS(300))==pdTRUE) {
+            for (auto &c: connCtxs) {
+                srv->disconnect(c.getHandle());
+            }
+            xSemaphoreGive(clisMtx);
+        }
+    }
+
+    // Remove callbacks
+    if (chKeyExTx)
+        chKeyExTx->setCallbacks(nullptr);
+    if (chKeyExRx)
+        chKeyExRx->setCallbacks(nullptr);
+    if (chDataRx)
+        chDataRx ->setCallbacks(nullptr);
+
+    // Clear semaphores
+    if(clisMtx){
+        vSemaphoreDelete(clisMtx);
+        clisMtx = nullptr;
+    }
+    if(keyExTxMtx){
+        vSemaphoreDelete(keyExTxMtx);
+        keyExTxMtx = nullptr;
+    }
+    if(txMtx){
+        vSemaphoreDelete(txMtx);
+        txMtx = nullptr;
+    }
+
+    // Clear context list
+    connCtxs.clear();
+
+    // Reset pointer and callback
+    chKeyExTx = nullptr;
+    chKeyExRx = nullptr;
+    chDataTx  = nullptr;
+    chDataRx  = nullptr;
+    srv       = nullptr;
+    onMsgReceived = nullptr;
+
+    NimBLEDevice::deinit(true);
+}
+
+void BLELNServer::setOnMessageReceivedCallback(std::function<void(uint16_t cliH, const std::string& msg)> cb) {
     onMsgReceived= std::move(cb);
 }
 
@@ -310,3 +365,41 @@ bool BLELNServer::sendEncrypted(uint16_t h, const std::string &msg) {
 
     return false;
 }
+
+void BLELNServer::startOtherServerSearch(uint32_t durationMs, const std::string &otherUUID, const std::function<void(bool)>& onResult) {
+    scanning = true;
+    onScanResult= onResult;
+    searchedUUID= otherUUID;
+    auto* scan=NimBLEDevice::getScan();
+    scan->setScanCallbacks(this, false);
+    scan->setActiveScan(true);
+    scan->start(durationMs, false, false);
+}
+
+void BLELNServer::onResult(const NimBLEAdvertisedDevice *advertisedDevice) {
+    if (advertisedDevice->isAdvertisingService(NimBLEUUID(searchedUUID))) {
+        scanning = false;
+        if(onScanResult){
+            onScanResult(true);
+        }
+    }
+}
+
+void BLELNServer::onScanEnd(const NimBLEScanResults &scanResults, int reason) {
+    scanning = false;
+    if(onScanResult){
+        onScanResult(false);
+    }
+}
+
+bool BLELNServer::noClientsConnected() {
+    uint8_t clisCnt=1;
+
+    if(xSemaphoreTake(clisMtx, pdMS_TO_TICKS(50))==pdTRUE){
+        clisCnt= connCtxs.size();
+        xSemaphoreGive(clisMtx);
+    }
+
+    return clisCnt==0;
+}
+

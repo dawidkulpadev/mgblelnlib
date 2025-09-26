@@ -6,7 +6,7 @@
 
 #include <utility>
 
-void BLELNClient::start(const std::string &name, std::function<void(std::string)> onServerResponse) {
+void BLELNClient::start(const std::string &name, std::function<void(const std::string&)> onServerResponse) {
     BLELNBase::rng_init();
     NimBLEDevice::init(name);
     NimBLEDevice::setSecurityAuth(true,true,true);
@@ -20,16 +20,54 @@ void BLELNClient::start(const std::string &name, std::function<void(std::string)
                 static_cast<BLELNClient*>(arg)->rxWorker();
                 vTaskDelete(nullptr);
             },
-            "BLELNrx", 4096, this, 5, nullptr, 1);
+            "BLELNrx", 3072, this, 5, nullptr, 1);
 }
 
 void BLELNClient::stop() {
+    if (scanning) {
+        NimBLEScan* scan = NimBLEDevice::getScan();
+        if(scan)
+            scan->stop();
+        scanning = false;
+        onScanResult = nullptr;
+    }
+
     runRxWorker= false;
+    if(g_rxQueue)
+        xQueueReset(g_rxQueue);
+
+    if(chKeyExTx)
+        chKeyExTx->unsubscribe(true);
+    if(chDataTx)
+        chDataTx ->unsubscribe(true);
 
     if(client!= nullptr){
         client->disconnect();
         NimBLEDevice::deleteClient(client);
+        client= nullptr;
     }
+
+    chKeyExTx = nullptr;
+    chKeyExRx = nullptr;
+    chDataTx  = nullptr;
+    chDataRx  = nullptr;
+    svc       = nullptr;
+
+    onMsgRx = nullptr;
+
+    s_sid = 0;
+    s_ctr_s2c = 0;
+    s_ctr_c2s = 0;
+    memset(s_sessKey_s2c, 0, sizeof(s_sessKey_s2c));
+    memset(s_sessKey_c2s, 0, sizeof(s_sessKey_c2s));
+    memset(s_cliPub, 0, sizeof(s_cliPub));
+    memset(s_srvPub, 0, sizeof(s_srvPub));
+    memset(s_cliNonce, 0, sizeof(s_cliNonce));
+    memset(s_srvNonce, 0, sizeof(s_srvNonce));
+    memset(s_salt, 0, sizeof(s_salt));
+    s_epoch = 0;
+    g_keyexPayload.clear();
+    g_keyexReady = false;
 
     NimBLEDevice::deinit(true);
 }
@@ -44,10 +82,10 @@ void BLELNClient::startServerSearch(uint32_t durationMs, const std::string &serv
     scan->start(durationMs, false, false);
 }
 
-void BLELNClient::beginConnect(const NimBLEAdvertisedDevice *advertisedDevice) {
+void BLELNClient::beginConnect(const NimBLEAdvertisedDevice *advertisedDevice, const std::function<void(bool, int)> &onConnectResult) {
     scanning = false;
+    onConRes= onConnectResult;
     NimBLEDevice::getScan()->stop();
-    Serial.println("Setting callbacks");
     client = NimBLEDevice::createClient();
     client->setClientCallbacks(this, false);
     client->connect(advertisedDevice, true, true, true);
@@ -100,6 +138,7 @@ bool BLELNClient::discover() {
     return chKeyExTx && chKeyExRx && chDataTx && chDataRx;
 }
 
+// TODO: Make nonblocking, rename "tryHandshake"
 bool BLELNClient::handshake() {
     // KEYEX_TX: [ver=1][epoch:4][salt:32][srvPub:65][srvNonce:12]
     uint32_t t0 = millis();
@@ -111,7 +150,7 @@ bool BLELNClient::handshake() {
     }
 
     if (!g_keyexReady) {
-        client->disconnect();
+        disconnect();
         Serial.println("[HX] timeout waiting KEYEX_TX notify");
         return false;
     } else {
@@ -120,21 +159,27 @@ bool BLELNClient::handshake() {
 
     const std::string &v = g_keyexPayload;
 
-    if (v.size()!=1+4+32+65+12 || (uint8_t)v[0]!=1) { Serial.printf("[HX] bad keyex len=%u\n",(unsigned)v.size()); return false; }
+    if (v.size()!=1+4+32+65+12 || (uint8_t)v[0]!=1) {
+        Serial.printf("[HX] bad keyex len=%u\n",(unsigned)v.size());
+        return false;
+    }
     memcpy(&s_epoch,  &v[1], 4);
     memcpy(s_salt,    &v[1+4], 32);
     memcpy(s_srvPub,  &v[1+4+32], 65);
     memcpy(s_srvNonce,&v[1+4+32+65], 12);
 
-    mbedtls_ecp_group g; mbedtls_mpi d; mbedtls_ecp_point Q;
+    mbedtls_ecp_group g;
+    mbedtls_mpi d;
+    mbedtls_ecp_point Q;
     if(!BLELNBase::ecdh_gen(s_cliPub,g,d,Q)){
         Serial.println("[HX] ecdh_gen fail");
         return false;
     }
     BLELNBase::random_bytes(s_cliNonce,12);
 
-    // Wyślij [ver=1][cliPub:65][cliNonce:12]
-    std::string tx; tx.push_back(1);
+    // [ver=1][cliPub:65][cliNonce:12]
+    std::string tx;
+    tx.push_back(1);
     tx.append((const char*)s_cliPub,65);
     tx.append((const char*)s_cliNonce,12);
 
@@ -269,16 +314,26 @@ void BLELNClient::appendToQueue(const std::string &m) {
     memcpy(heapBuf, m.data(), m.size());
 
     RxClientPacket pkt{ m.size(), heapBuf };
-    if (xQueueSend(g_rxQueue, &pkt, 0) != pdPASS) {
+    if (xQueueSend(g_rxQueue, &pkt, pdMS_TO_TICKS(10)) != pdPASS) {
         free(heapBuf);
     }
 }
 
 void BLELNClient::rxWorker() {
-    while (runRxWorker) {
+    for(;;) {
+        if(!runRxWorker){
+            if (g_rxQueue) {
+                RxClientPacket pkt{};
+                while (xQueueReceive(g_rxQueue, &pkt, 0) == pdPASS) {
+                    free(pkt.buf);
+                }
+            }
+            return;
+        }
+
         if(s_sid!=0) {
             RxClientPacket pkt{};
-            if (xQueueReceive(g_rxQueue, &pkt, portMAX_DELAY) == pdTRUE) {
+            if (xQueueReceive(g_rxQueue, &pkt, pdMS_TO_TICKS(50)) == pdTRUE) {
                 if (pkt.len >= 4 + 12 + 16) {
                     const uint8_t *ctrBE = pkt.buf;
                     const uint8_t *nonce = pkt.buf + 4;
@@ -328,10 +383,10 @@ void BLELNClient::rxWorker() {
             if (uxQueueMessagesWaiting(g_rxQueue) > 0) {
                 vTaskDelay(pdMS_TO_TICKS(1));
             } else {
-                vTaskDelay(pdMS_TO_TICKS(100));
+                vTaskDelay(pdMS_TO_TICKS(50));
             }
         } else {
-            vTaskDelay(pdMS_TO_TICKS(100));
+            vTaskDelay(pdMS_TO_TICKS(50));
         }
     }
 }
@@ -341,7 +396,44 @@ void BLELNClient::onDisconnect(NimBLEClient *pClient, int reason) {
 }
 
 void BLELNClient::onConnect(NimBLEClient *pClient) {
+    if(onConRes){
+        onConRes(true, 0);
+    }
     Serial.println("Client connected");
+}
+
+void BLELNClient::onConnectFail(NimBLEClient *pClient, int reason) {
+    if(onConRes)
+        onConRes(false, reason);
+}
+
+
+void BLELNClient::disconnect() {
+    chKeyExTx->unsubscribe();
+    chDataTx->unsubscribe();
+
+    svc= nullptr;
+    chKeyExTx = nullptr;
+    chKeyExRx = nullptr;
+    chDataTx  = nullptr;
+    chDataRx  = nullptr;
+
+    client->disconnect();
+    NimBLEDevice::deleteClient(client);
+
+    s_sid = 0;
+    s_ctr_s2c = 0;
+    s_ctr_c2s = 0;
+    memset(s_sessKey_s2c, 0, sizeof(s_sessKey_s2c));
+    memset(s_sessKey_c2s, 0, sizeof(s_sessKey_c2s));
+    memset(s_cliPub, 0, sizeof(s_cliPub));
+    memset(s_srvPub, 0, sizeof(s_srvPub));
+    memset(s_cliNonce, 0, sizeof(s_cliNonce));
+    memset(s_srvNonce, 0, sizeof(s_srvNonce));
+    memset(s_salt, 0, sizeof(s_salt));
+    s_epoch = 0;
+    g_keyexPayload.clear();
+    g_keyexReady = false;
 }
 
 
